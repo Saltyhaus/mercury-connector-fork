@@ -46,4 +46,11 @@ void *spool_input_directory_thread(void *conn);
 bool queue_msg_path(char *msg_path, rhizo_conn *connector);
 bool remove_all_msg_path_queue(rhizo_conn *connector);
 
+// multi-peer spool routines
+int find_peer(rhizo_conn *connector, const char *call_sign);
+bool spool_create_peer_dirs(rhizo_conn *connector);
+bool spool_peer_has_mail(rhizo_conn *connector, int peer_idx);
+int spool_load_peer(rhizo_conn *connector, int peer_idx);
+void spool_reset_tx(rhizo_conn *connector);
+
 #endif /* HAVE_SPOOL__ */

@@ -43,6 +43,9 @@
 #include <dirent.h>
 #include <sys/inotify.h>
 #include <libgen.h>
+#include <errno.h>
+#include <strings.h>
+#include <time.h>
 
 #include "spool.h"
 
@@ -281,4 +284,172 @@ void *spool_input_directory_thread(void *conn)
     fprintf(stderr, "Spool is finishing...\n");
 
     return NULL;
+}
+
+
+/* ------------------------------------------------------------------------
+ * Multi-peer support (VARA/Mercury)
+ *
+ * Outgoing mail for each remote station lives in its own subdirectory of the
+ * input spool:  <input_directory>/<CALLSIGN>/   Files placed directly in
+ * <input_directory> go to the default peer (the first -d callsign), so a
+ * single-peer setup behaves exactly as before.
+ *
+ * Mail is only loaded into the transmit buffer once a session is established
+ * and the remote callsign is known, and only that station's mail is loaded.
+ * When a session ends, anything not yet acknowledged is dropped from the
+ * buffer WITHOUT deleting the files, so it is retried on the next session
+ * with the right station.
+ * ------------------------------------------------------------------------ */
+
+int find_peer(rhizo_conn *connector, const char *call_sign)
+{
+    if (call_sign == NULL || call_sign[0] == 0)
+        return -1;
+    for (int i = 0; i < connector->num_peers; i++)
+    {
+        if (!strcasecmp(connector->peers[i], call_sign))
+            return i;
+    }
+    return -1;
+}
+
+static void peer_dir(rhizo_conn *connector, int peer_idx, char *out, size_t out_size)
+{
+    snprintf(out, out_size, "%s%s/", connector->input_directory, connector->peers[peer_idx]);
+}
+
+bool spool_create_peer_dirs(rhizo_conn *connector)
+{
+    char dir[1100];
+    bool ok = true;
+
+    for (int i = 0; i < connector->num_peers; i++)
+    {
+        peer_dir(connector, i, dir, sizeof(dir));
+        if (mkdir(dir, 0775) != 0 && errno != EEXIST)
+        {
+            fprintf(stderr, "Could not create peer spool directory %s: %s\n", dir, strerror(errno));
+            ok = false;
+        }
+        else
+        {
+            fprintf(stderr, "Peer %s%s: outgoing spool %s\n", connector->peers[i],
+                    i == 0 ? " (default)" : "", dir);
+        }
+    }
+    return ok;
+}
+
+static bool path_is_queued(rhizo_conn *connector, const char *path)
+{
+    bool found = false;
+    pthread_mutex_lock(&connector->msg_path_queue_mutex);
+    for (size_t i = 0; i < connector->msg_path_queue_size; i++)
+    {
+        if (!strcmp(connector->msg_path_queue[i], path))
+        {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&connector->msg_path_queue_mutex);
+    return found;
+}
+
+/* Walk one directory. If load is false, return 1 as soon as one eligible file
+ * is found. If load is true, load every eligible file and return the count. */
+static int scan_dir(rhizo_conn *connector, const char *dir, bool load)
+{
+    char path[2048];
+    struct stat st;
+    struct dirent *dp;
+    int count = 0;
+    time_t now = time(NULL);
+
+    DIR *dirp = opendir(dir);
+    if (dirp == NULL)
+        return 0;
+
+    while ((dp = readdir(dirp)) != NULL)
+    {
+        if (dp->d_name[0] == '.')            // hidden / temporary files
+            continue;
+
+        snprintf(path, sizeof(path), "%s%s", dir, dp->d_name);
+
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        if (now - st.st_mtime < SPOOL_SETTLE_S) // probably still being written
+            continue;
+        if (path_is_queued(connector, path))  // already in the buffer this session
+            continue;
+
+        if (!load)
+        {
+            count = 1;
+            break;
+        }
+
+        if (connector->msg_path_queue_size >= 4000)
+        {
+            fprintf(stderr, "Message queue full, remaining files will be sent next session.\n");
+            break;
+        }
+
+        if (write_message_to_buffer(path, connector))
+            count++;
+    }
+    closedir(dirp);
+    return count;
+}
+
+bool spool_peer_has_mail(rhizo_conn *connector, int peer_idx)
+{
+    char dir[1100];
+
+    if (peer_idx < 0 || peer_idx >= connector->num_peers)
+        return false;
+
+    peer_dir(connector, peer_idx, dir, sizeof(dir));
+    if (scan_dir(connector, dir, false))
+        return true;
+
+    if (peer_idx == 0 && scan_dir(connector, connector->input_directory, false))
+        return true;
+
+    return false;
+}
+
+int spool_load_peer(rhizo_conn *connector, int peer_idx)
+{
+    char dir[1100];
+    int count = 0;
+
+    if (peer_idx < 0 || peer_idx >= connector->num_peers)
+        return 0;
+
+    peer_dir(connector, peer_idx, dir, sizeof(dir));
+    count += scan_dir(connector, dir, true);
+
+    if (peer_idx == 0)
+        count += scan_dir(connector, connector->input_directory, true);
+
+    return count;
+}
+
+/* Drop everything not yet handed to the modem and forget the queued paths
+ * WITHOUT deleting the files. Caller must make sure the data tx thread is
+ * parked (tx_hold && tx_idle). */
+void spool_reset_tx(rhizo_conn *connector)
+{
+    pthread_mutex_lock(&connector->in_buffer.mutex);
+    ring_buffer_clear(&connector->in_buffer.buf);
+    pthread_mutex_unlock(&connector->in_buffer.mutex);
+
+    pthread_mutex_lock(&connector->msg_path_queue_mutex);
+    for (size_t i = 0; i < connector->msg_path_queue_size; i++)
+        free(connector->msg_path_queue[i]);
+    connector->msg_path_queue_size = 0;
+    pthread_mutex_unlock(&connector->msg_path_queue_mutex);
 }

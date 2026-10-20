@@ -125,6 +125,51 @@ bool initialize_connector(rhizo_conn *connector){
     connector->timeout = TIMEOUT_DEFAULT;
     connector->ofdm_mode = true;
     connector->buffer_size = 0;
+
+    connector->num_peers = 0;
+    connector->next_peer = 0;
+    connector->retry_backoff = RETRY_BACKOFF_DEFAULT;
+    connector->attempt_peer = -1;
+    connector->attempt_time = 0;
+    connector->session_peer[0] = 0;
+    connector->session_active = false;
+    connector->session_ready = false;
+    connector->tx_hold = true;
+    connector->tx_idle = false;
+    for (int i = 0; i < MAX_PEERS; i++)
+        connector->peer_retry_after[i] = 0;
+    return true;
+}
+
+/* -d accepts one callsign or a comma separated list (CALL1,CALL2,...).
+ * The first one is the default peer (also used by ARDOP). */
+static bool parse_peers(rhizo_conn *connector, const char *list)
+{
+    char tmp[1024];
+    char *save = NULL;
+
+    snprintf(tmp, sizeof(tmp), "%s", list);
+    connector->num_peers = 0;
+
+    for (char *tok = strtok_r(tmp, ", ", &save); tok; tok = strtok_r(NULL, ", ", &save))
+    {
+        if (connector->num_peers >= MAX_PEERS)
+        {
+            fprintf(stderr, "Too many peers (max %d).\n", MAX_PEERS);
+            return false;
+        }
+        if (strlen(tok) >= sizeof(connector->peers[0]))
+        {
+            fprintf(stderr, "Callsign too long: %s\n", tok);
+            return false;
+        }
+        strcpy(connector->peers[connector->num_peers++], tok);
+    }
+
+    if (connector->num_peers == 0)
+        return false;
+
+    strcpy(connector->remote_call_sign, connector->peers[0]);
     return true;
 }
 
@@ -164,7 +209,11 @@ int main (int argc, char *argv[])
         fprintf(stderr, " -i input_spool_directory    Input spool directory (Messages to send).\n");
         fprintf(stderr, " -o output_spool_directory    Output spool directory (Received messages).\n");
         fprintf(stderr, " -c callsign                        Station Callsign (Eg: PU2HFF).\n");
-        fprintf(stderr, " -d remote_callsign           Remote Station Callsign.\n");
+        fprintf(stderr, " -d remote_callsign[,call2,...] Remote Station Callsign(s). With several, outgoing mail goes in\n");
+        fprintf(stderr, "                               input_spool_directory/<CALLSIGN>/; files in input_spool_directory\n");
+        fprintf(stderr, "                               itself go to the first one (VARA/Mercury only).\n");
+        fprintf(stderr, " -w retry_wait                Seconds before calling a station again after a failed call or\n");
+        fprintf(stderr, "                               finished session (default %d).\n", RETRY_BACKOFF_DEFAULT);
         fprintf(stderr, " -a tnc_ip_address            IP address of the TNC,\n");
         fprintf(stderr, " -p tcp_base_port              TCP base port of the TNC. For VARA and ARDOP ports tcp_base_port and tcp_base_port+1 are used,\n");
         fprintf(stderr, " -t timeout                 Time to wait before disconnect when idling.\n");
@@ -180,7 +229,7 @@ int main (int argc, char *argv[])
 
     char *last;
     int opt;
-    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:l")) != -1)
+    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:")) != -1)
     {
         switch (opt)
         {
@@ -195,7 +244,16 @@ int main (int argc, char *argv[])
             strcpy(connector.call_sign, optarg);
             break;
         case 'd':
-            strcpy(connector.remote_call_sign, optarg);
+            if (!parse_peers(&connector, optarg))
+            {
+                fprintf(stderr, "Invalid -d remote callsign list: %s\n", optarg);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case 'w':
+            connector.retry_backoff = atoi(optarg);
+            if (connector.retry_backoff < 0)
+                connector.retry_backoff = 0;
             break;
         case 't':
             connector.timeout = atoi(optarg);
@@ -243,6 +301,12 @@ int main (int argc, char *argv[])
         default:
             goto manual;
         }
+    }
+
+    if (connector.num_peers == 0)
+    {
+        fprintf(stderr, "A remote callsign (-d) is required.\n");
+        goto manual;
     }
 
     if (connector.radio_type != -1)
@@ -349,7 +413,19 @@ connector_start:
 
     pthread_t tid[3];
 
-    pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
+    if (!strcmp("ardop", connector.modem_type))
+    {
+        // ARDOP keeps the original single-peer spool: load on arrival, send
+        // to whoever is connected
+        pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
+    }
+    else
+    {
+        // VARA/Mercury: per-peer spool, mail loaded only once the session's
+        // remote station is known (see vara.c)
+        if (!spool_create_peer_dirs(&connector))
+            fprintf(stderr, "Warning: some peer spool directories could not be created.\n");
+    }
     pthread_create(&tid[1], NULL, spool_output_directory_thread, (void *) &connector);
 
     // pthread_create(&tid[2], NULL, modem_thread, (void *) &connector);

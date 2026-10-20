@@ -43,6 +43,9 @@
 
 #include "common.h"
 #include "net.h"
+#include <strings.h>
+#include <time.h>
+
 #include "spool.h"
 #include "vara.h"
 #include "radio_io.h"
@@ -56,8 +59,19 @@ void *vara_data_worker_thread_tx(void *conn)
     while(connector->tcp_ret_ok){
 
         // check if we are connected, otherwise, wait
+        // tx_hold: session setup/teardown in progress, the buffer may be
+        // reset under us, so stay parked (and say so via tx_idle).
+        // Announce "busy" BEFORE re-checking tx_hold (seq_cst atomics), so the
+        // control thread can never reset the buffer while we are reading it.
         connector->safe_state++;
-        while (connector->connected == false || ring_buffer_count_bytes(&connector->in_buffer.buf) == 0){
+        while (true){
+            if (connector->connected && !connector->tx_hold &&
+                ring_buffer_count_bytes(&connector->in_buffer.buf) > 0){
+                connector->tx_idle = false;
+                if (connector->connected && !connector->tx_hold)
+                    break;
+            }
+            connector->tx_idle = true;
             if (connector->tcp_ret_ok == false){
                 connector->safe_state--;
                 goto exit_local;
@@ -163,6 +177,7 @@ void *vara_control_worker_thread_rx(void *conn)
             if (!strcmp((char *) buffer, "DISCONNECTED"))
             {
                 fprintf(stderr, "TNC: %s\n", buffer);
+                connector->tx_hold = true;        // park tx before anything else
                 connector->connected = false;
                 connector->waiting_for_connection = false;
             }
@@ -171,7 +186,25 @@ void *vara_control_worker_thread_rx(void *conn)
             // other commands here
                 if (!memcmp(buffer, "CONNECTED", strlen("CONNECTED")))
                 {
+                    // "CONNECTED <source> <destination> <bw>": the remote
+                    // station is whichever callsign is not ours (source on
+                    // inbound calls, destination on our own outbound calls)
+                    char src[32] = {0}, dst[32] = {0};
+                    const char *peer = NULL;
+
+                    sscanf((char *) buffer, "CONNECTED %31s %31s", src, dst);
+                    if (src[0] && strcasecmp(src, connector->call_sign))
+                        peer = src;
+                    else if (dst[0] && strcasecmp(dst, connector->call_sign))
+                        peer = dst;
+
                     fprintf(stderr, "TNC: %s\n", buffer);
+
+                    connector->tx_hold = true;   // nothing goes out until this peer's mail is loaded
+                    connector->session_ready = false;
+                    snprintf(connector->session_peer, sizeof(connector->session_peer), "%s",
+                             peer ? peer : "");
+                    connector->session_active = true;
                     connector->connected = true;
                     connector->waiting_for_connection = false;
                 }
@@ -187,9 +220,14 @@ void *vara_control_worker_thread_rx(void *conn)
                             connector->timeout_counter = 0;
 
                         // our delete messages mechanism
+                        // only delete what this session actually handed to
+                        // the modem: buffer drained, tx thread finished
+                        // writing, and the session's mail was loaded
                         if (buf_size == 0 &&
                             ring_buffer_count_bytes(&connector->in_buffer.buf) == 0 &&
-                            connector->connected == true)
+                            connector->connected == true &&
+                            connector->session_ready &&
+                            connector->tx_idle)
                         {
 
                             fprintf(stderr, "Messages successfully sent. Erasing messages...\n");
@@ -254,22 +292,104 @@ void *vara_control_worker_thread_tx(void *conn)
     while(connector->tcp_ret_ok)
     {
 
-        // Logic to start a connection
-        // condition for connection: no connection AND something to transmitt AND we did not issue a CONNECT recently
+        time_t now = time(NULL);
+
+        // Session teardown: the link is gone. Once the data tx thread is
+        // parked, drop whatever was not handed to the modem (files are kept
+        // and retried next session with the right station).
+        if (connector->session_active && !connector->connected && connector->tx_idle)
+        {
+            size_t pending = connector->msg_path_queue_size;
+            int idx = find_peer(connector, connector->session_peer);
+
+            spool_reset_tx(connector);
+            if (idx >= 0)
+                connector->peer_retry_after[idx] = now + connector->retry_backoff;
+
+            fprintf(stderr, "Session with %s ended (%zu unacknowledged message(s) kept for retry).\n",
+                    connector->session_peer[0] ? connector->session_peer : "unknown", pending);
+
+            connector->session_peer[0] = 0;
+            connector->session_ready = false;
+            connector->attempt_peer = -1;
+            connector->session_active = false;
+        }
+
+        // Session setup: load ONLY this station's mail, then release tx.
+        if (connector->session_active && connector->connected &&
+            !connector->session_ready && connector->tx_idle)
+        {
+            int idx = find_peer(connector, connector->session_peer);
+
+            spool_reset_tx(connector);   // never carry bytes over from another session
+            if (idx >= 0)
+            {
+                int n = spool_load_peer(connector, idx);
+                fprintf(stderr, "Session with %s: %d message(s) queued.\n", connector->peers[idx], n);
+            }
+            else
+            {
+                fprintf(stderr, "Session with %s (not a configured peer): receive only.\n",
+                        connector->session_peer[0] ? connector->session_peer : "unknown station");
+            }
+            connector->attempt_peer = -1;
+            connector->session_ready = true;
+            connector->tx_hold = false;
+        }
+        // Mid-session: pick up mail for this station that arrived after setup.
+        else if (connector->session_active && connector->connected && connector->session_ready)
+        {
+            int idx = find_peer(connector, connector->session_peer);
+            if (idx >= 0)
+            {
+                int n = spool_load_peer(connector, idx);
+                if (n > 0)
+                    fprintf(stderr, "Session with %s: %d more message(s) queued.\n", connector->peers[idx], n);
+            }
+        }
+
+        // Outbound attempt that never became a session (modem answered
+        // DISCONNECTED, or never answered at all): back off that peer.
+        if (connector->attempt_peer >= 0 && !connector->session_active)
+        {
+            if (!connector->waiting_for_connection ||
+                now - connector->attempt_time > CONNECT_ATTEMPT_MAX_S)
+            {
+                fprintf(stderr, "Call to %s failed, retrying in %d s.\n",
+                        connector->peers[connector->attempt_peer], connector->retry_backoff);
+                connector->peer_retry_after[connector->attempt_peer] = now + connector->retry_backoff;
+                connector->attempt_peer = -1;
+                connector->waiting_for_connection = false;
+            }
+        }
+
+        // Logic to start a connection: idle, and some peer (not backing off)
+        // has mail waiting. Peers take turns so none is starved.
         if (connector->connected == false &&
-            ring_buffer_count_bytes(&connector->in_buffer.buf) > 0 &&
+            !connector->session_active &&
             !connector->waiting_for_connection)
         {
+            for (int k = 0; k < connector->num_peers; k++)
+            {
+                int idx = (connector->next_peer + k) % connector->num_peers;
 
-            // \todo try to add some entropy in order to avoid on air clashes
-            memset(buffer,0,sizeof(buffer));
-            sprintf(buffer,"CONNECT %s %s\r", connector->call_sign,
-                    connector->remote_call_sign);
-            connector->tcp_ret_ok &= tcp_write(connector->control_socket, (uint8_t *)buffer, strlen(buffer));
+                if (now < connector->peer_retry_after[idx] || !spool_peer_has_mail(connector, idx))
+                    continue;
 
-            fprintf(stderr, "CONNECTING... %s\n", buffer);
+                // \todo try to add some entropy in order to avoid on air clashes
+                memset(buffer,0,sizeof(buffer));
+                snprintf(buffer, sizeof(buffer), "CONNECT %s %s\r", connector->call_sign,
+                         connector->peers[idx]);
+                connector->tcp_ret_ok &= tcp_write(connector->control_socket, (uint8_t *)buffer, strlen(buffer));
 
-            connector->waiting_for_connection = true;
+                fprintf(stderr, "CONNECTING... %s\n", buffer);
+
+                connector->attempt_peer = idx;
+                connector->attempt_time = now;
+                connector->next_peer = (idx + 1) % connector->num_peers;
+                connector->waiting_for_connection = true;
+                break;
+            }
         }
 
         // Logic to disconnect on timeout
@@ -277,6 +397,7 @@ void *vara_control_worker_thread_tx(void *conn)
             connector->connected == true)
         {
 
+            connector->tx_hold = true;
             connector->connected = false;
 
             while (connector->safe_state != 2)
