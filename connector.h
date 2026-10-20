@@ -56,6 +56,11 @@ extern "C" {
 #define CONNECT_ATTEMPT_MAX_S 300
 // ignore spool files modified more recently than this (still being written)
 #define SPOOL_SETTLE_S 2
+// largest frame (filename + payload) accepted from the air; anything bigger
+// means the stream is corrupt
+#define MAX_RX_MSG_SIZE (16u * 1024u * 1024u)
+// longest filename written to the output spool
+#define MAX_RX_NAME_LEN 100
 
 typedef struct{
 // public
@@ -104,6 +109,8 @@ typedef struct{
     atomic_bool session_ready;      // this session's mail has been loaded
     atomic_bool tx_hold;            // data tx thread must not send
     atomic_bool tx_idle;            // data tx thread is parked in its wait loop
+    atomic_uint rx_session_gen;     // bumped on every CONNECTED/DISCONNECTED; a
+                                    // received frame must start and end in one
 } rhizo_conn;
 
 #ifdef __cplusplus

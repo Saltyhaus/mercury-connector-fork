@@ -45,6 +45,8 @@
 #include "net.h"
 #include <strings.h>
 #include <time.h>
+#include <poll.h>
+#include <errno.h>
 
 #include "spool.h"
 #include "vara.h"
@@ -99,52 +101,167 @@ exit_local:
     return EXIT_SUCCESS;
 }
 
+/* ---------------------------------------------------------------------
+ * Receive side.
+ *
+ * The data socket to the TNC stays open across ARQ sessions, so a plain
+ * blocking read that is halfway through a frame when a link drops would
+ * keep going with the NEXT session's bytes, merging two messages and
+ * misframing everything after them. Instead, every read is bounded by
+ * the session it started in (rx_session_gen): a frame is only accepted
+ * if all of it arrives within one session; a partial one is discarded
+ * (the sender never got BUFFER 0 for it, so it keeps the file and
+ * resends it). Bytes arriving while no session is up belong to one that
+ * already ended and are dropped. Only complete frames are handed to the
+ * output spool thread.
+ * --------------------------------------------------------------------- */
+
+#define RX_POLL_MS 500
+
+static void rx_set_safe(rhizo_conn *connector, bool *safe, bool want)
+{
+    if (want && !*safe)
+    {
+        connector->safe_state++;
+        *safe = true;
+    }
+    else if (!want && *safe)
+    {
+        connector->safe_state--;
+        *safe = false;
+    }
+}
+
+/* Wait up to RX_POLL_MS and throw away whatever is readable. */
+static void rx_discard_pending(rhizo_conn *connector)
+{
+    uint8_t scratch[1024];
+    struct pollfd pfd = { .fd = connector->data_socket, .events = POLLIN };
+
+    int r = poll(&pfd, 1, RX_POLL_MS);
+    if (r <= 0)
+        return;
+
+    ssize_t len = recv(connector->data_socket, scratch, sizeof(scratch), 0);
+    if (len == 0 || (len < 0 && errno != EINTR))
+    {
+        fprintf(stderr, "Data socket closed by TNC.\n");
+        connector->tcp_ret_ok = false;
+    }
+    else if (len > 0)
+    {
+        fprintf(stderr, "Discarded %zd byte(s) not belonging to a live session.\n", len);
+    }
+}
+
+/* Read exactly n bytes of the session identified by gen. Returns false if
+ * that session ends (or a new one starts) first, or the socket fails. */
+static bool rx_read_session(rhizo_conn *connector, uint8_t *buf, size_t n, unsigned gen)
+{
+    size_t got = 0;
+
+    while (got < n)
+    {
+        if (!connector->tcp_ret_ok || !connector->connected || connector->rx_session_gen != gen)
+            return false;
+
+        struct pollfd pfd = { .fd = connector->data_socket, .events = POLLIN };
+        int r = poll(&pfd, 1, RX_POLL_MS);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "Data socket poll error (%s).\n", strerror(errno));
+            connector->tcp_ret_ok = false;
+            return false;
+        }
+        if (r == 0)
+            continue;
+
+        // re-check: bytes must not be taken for a session that just ended
+        if (!connector->connected || connector->rx_session_gen != gen)
+            return false;
+
+        ssize_t len = recv(connector->data_socket, buf + got, n - got, 0);
+        if (len < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "Data socket read error (%s).\n", strerror(errno));
+            connector->tcp_ret_ok = false;
+            return false;
+        }
+        if (len == 0)
+        {
+            fprintf(stderr, "Data socket closed by TNC.\n");
+            connector->tcp_ret_ok = false;
+            return false;
+        }
+        got += (size_t) len;
+        connector->timeout_counter = 0;
+    }
+    return true;
+}
+
 void *vara_data_worker_thread_rx(void *conn)
 {
     rhizo_conn *connector = (rhizo_conn *) conn;
-    int block_size = 64;
-    uint8_t buffer[64];
-    uint32_t buf_size;
+    bool safe = false;
 
-
-    while(connector->tcp_ret_ok)
+    while (connector->tcp_ret_ok)
     {
-        connector->safe_state++;
-        while (connector->connected == false) {
-            if (connector->tcp_ret_ok == false){
-                connector->safe_state--;
-                goto exit_local;
-            }
-            sleep(1);
-        }
-        buf_size = 0;
+        // idle (waiting for a frame to start) counts as "safe" for the
+        // idle-timeout logic, exactly like the original header wait
+        rx_set_safe(connector, &safe, true);
 
-        connector->tcp_ret_ok &= tcp_read(connector->data_socket, (uint8_t *) &buf_size, sizeof(buf_size));
-        connector->safe_state--;
-
-        write_buffer(&connector->out_buffer, (uint8_t *) &buf_size, sizeof(buf_size));
-
-        connector->timeout_counter = 0;
-
-        while (buf_size != 0)
+        if (!connector->connected)
         {
-            if (buf_size >= block_size)
-            {
-                connector->tcp_ret_ok &= tcp_read(connector->data_socket, buffer, block_size);
-                write_buffer(&connector->out_buffer, buffer, block_size);
-                buf_size -= block_size;
-            }
-            else
-            {
-                connector->tcp_ret_ok &= tcp_read(connector->data_socket, buffer, buf_size);
-                write_buffer(&connector->out_buffer, buffer, buf_size);
-                buf_size = 0;
-            }
-            connector->timeout_counter = 0;
+            rx_discard_pending(connector);
+            continue;
         }
+
+        unsigned gen = connector->rx_session_gen;
+        uint32_t frame_size = 0;
+
+        if (!rx_read_session(connector, (uint8_t *) &frame_size, sizeof(frame_size), gen))
+            continue;
+
+        if (frame_size == 0 || frame_size > MAX_RX_MSG_SIZE)
+        {
+            fprintf(stderr, "Corrupt frame header (length %u): discarding the rest of this session's data.\n",
+                    frame_size);
+            while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
+                rx_discard_pending(connector);
+            continue;
+        }
+
+        rx_set_safe(connector, &safe, false);   // mid-frame: not idle
+
+        uint8_t *frame = (uint8_t *) malloc(frame_size);
+        if (frame == NULL)
+        {
+            fprintf(stderr, "Out of memory for a %u byte frame, discarding the rest of this session.\n", frame_size);
+            rx_set_safe(connector, &safe, true);
+            while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
+                rx_discard_pending(connector);
+            continue;
+        }
+
+        if (!rx_read_session(connector, frame, frame_size, gen))
+        {
+            fprintf(stderr, "Link lost mid-message: partial message (%u bytes expected) discarded, "
+                    "sender will retry.\n", frame_size);
+            free(frame);
+            continue;
+        }
+
+        // complete frame: hand it to the output spool thread in one piece
+        write_buffer(&connector->out_buffer, (uint8_t *) &frame_size, sizeof(frame_size));
+        write_buffer(&connector->out_buffer, frame, frame_size);
+        free(frame);
     }
 
-exit_local:
+    rx_set_safe(connector, &safe, false);
     return EXIT_SUCCESS;
 }
 
@@ -178,6 +295,7 @@ void *vara_control_worker_thread_rx(void *conn)
             {
                 fprintf(stderr, "TNC: %s\n", buffer);
                 connector->tx_hold = true;        // park tx before anything else
+                connector->rx_session_gen++;      // abandon any partial rx frame
                 connector->connected = false;
                 connector->waiting_for_connection = false;
             }
@@ -205,6 +323,7 @@ void *vara_control_worker_thread_rx(void *conn)
                     snprintf(connector->session_peer, sizeof(connector->session_peer), "%s",
                              peer ? peer : "");
                     connector->session_active = true;
+                    connector->rx_session_gen++;   // frames must start in this session
                     connector->connected = true;
                     connector->waiting_for_connection = false;
                 }
@@ -398,6 +517,7 @@ void *vara_control_worker_thread_tx(void *conn)
         {
 
             connector->tx_hold = true;
+            connector->rx_session_gen++;
             connector->connected = false;
 
             while (connector->safe_state != 2)

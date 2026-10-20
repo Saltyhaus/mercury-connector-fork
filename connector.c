@@ -136,6 +136,7 @@ bool initialize_connector(rhizo_conn *connector){
     connector->session_ready = false;
     connector->tx_hold = true;
     connector->tx_idle = false;
+    connector->rx_session_gen = 0;
     for (int i = 0; i < MAX_PEERS; i++)
         connector->peer_retry_after[i] = 0;
     return true;
