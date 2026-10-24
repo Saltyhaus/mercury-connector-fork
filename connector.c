@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -115,6 +116,10 @@ bool initialize_connector(rhizo_conn *connector){
     connector->serial_path[0] = 0;
     connector->connected = false;
     connector->waiting_for_connection = false;
+    connector->incoming_pending = false;
+    connector->pending_since = 0;
+    connector->channel_busy_until = 0;
+    srand((unsigned) time(NULL) ^ (unsigned) getpid());
     connector->serial_keying = false;
     connector->radio_type = -1;
     connector->tcp_ret_ok = true;

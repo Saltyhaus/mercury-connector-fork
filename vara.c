@@ -294,6 +294,7 @@ void *vara_control_worker_thread_rx(void *conn)
             if (!strcmp((char *) buffer, "DISCONNECTED"))
             {
                 fprintf(stderr, "TNC: %s\n", buffer);
+                connector->incoming_pending = false;
                 connector->tx_hold = true;        // park tx before anything else
                 connector->rx_session_gen++;      // abandon any partial rx frame
                 connector->connected = false;
@@ -323,9 +324,29 @@ void *vara_control_worker_thread_rx(void *conn)
                     snprintf(connector->session_peer, sizeof(connector->session_peer), "%s",
                              peer ? peer : "");
                     connector->session_active = true;
+                    connector->incoming_pending = false;
                     connector->rx_session_gen++;   // frames must start in this session
                     connector->connected = true;
                     connector->waiting_for_connection = false;
+                }
+                else if (!strcmp((char *) buffer, "PENDING"))
+                {
+                    // Another station is calling us and the modem is
+                    // answering. Starting our own CONNECT now would cancel
+                    // that handshake and both stations would then call each
+                    // other and miss -- so hold our own calls until this
+                    // resolves (CONNECTED, CANCELPENDING, or 30 s).
+                    fprintf(stderr, "%s\n", buffer);
+                    connector->pending_since = (long) time(NULL);
+                    connector->incoming_pending = true;
+                }
+                else if (!strcmp((char *) buffer, "CANCELPENDING"))
+                {
+                    fprintf(stderr, "%s\n", buffer);
+                    connector->incoming_pending = false;
+                    // the other station may still be retrying: give it a
+                    // random head start before we call out ourselves
+                    connector->channel_busy_until = (long) time(NULL) + 15 + rand() % 30;
                 }
                 else
                 {
@@ -474,19 +495,30 @@ void *vara_control_worker_thread_tx(void *conn)
             if (!connector->waiting_for_connection ||
                 now - connector->attempt_time > CONNECT_ATTEMPT_MAX_S)
             {
+                // random extra wait, so two stations that keep calling each
+                // other at the same moment drift apart instead of clashing again
+                int wait = connector->retry_backoff + rand() % (connector->retry_backoff / 4 + 1);
                 fprintf(stderr, "Call to %s failed, retrying in %d s.\n",
-                        connector->peers[connector->attempt_peer], connector->retry_backoff);
-                connector->peer_retry_after[connector->attempt_peer] = now + connector->retry_backoff;
+                        connector->peers[connector->attempt_peer], wait);
+                connector->peer_retry_after[connector->attempt_peer] = now + wait;
                 connector->attempt_peer = -1;
                 connector->waiting_for_connection = false;
             }
         }
 
-        // Logic to start a connection: idle, and some peer (not backing off)
-        // has mail waiting. Peers take turns so none is starved.
+        // A PENDING that never resolved (no CONNECTED/CANCELPENDING): stop
+        // waiting for it after 30 s.
+        if (connector->incoming_pending && now - (time_t) connector->pending_since > 30)
+            connector->incoming_pending = false;
+
+        // Logic to start a connection: idle, nobody calling us right now,
+        // and some peer (not backing off) has mail waiting. Peers take
+        // turns so none is starved.
         if (connector->connected == false &&
             !connector->session_active &&
-            !connector->waiting_for_connection)
+            !connector->waiting_for_connection &&
+            !connector->incoming_pending &&
+            now >= (time_t) connector->channel_busy_until)
         {
             for (int k = 0; k < connector->num_peers; k++)
             {

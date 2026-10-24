@@ -84,6 +84,9 @@ typedef struct{
     atomic_bool tcp_ret_ok;
     atomic_bool connected;
     atomic_bool waiting_for_connection;
+    atomic_bool incoming_pending;   // modem reported PENDING: another station is calling us
+    atomic_long pending_since;      // when that PENDING arrived (time_t)
+    atomic_long channel_busy_until; // don't start our own call before this (time_t)
     atomic_int timeout_counter;
     atomic_int safe_state; // this means green light for changing state
 
