@@ -137,6 +137,18 @@ bool initialize_connector(rhizo_conn *connector){
     connector->attempt_peer = -1;
     connector->attempt_time = 0;
     connector->session_peer[0] = 0;
+    connector->guests_enabled = false;
+    connector->session_kind = SESSION_PEER;
+    connector->guest_call[0] = 0;
+    connector->guest_msgs = 0;
+    connector->guest_echoes = 0;
+    pthread_mutex_init(&connector->echo_mutex, NULL);
+    connector->echo_pending = false;
+    connector->echo_gen = 0;
+    connector->echo_quote[0] = 0;
+    connector->snr_x10 = 0;
+    connector->snr_valid = false;
+    connector->bps = 0;
     connector->session_active = false;
     connector->session_ready = false;
     connector->tx_hold = true;
@@ -220,6 +232,9 @@ int main (int argc, char *argv[])
         fprintf(stderr, "                               itself go to the first one (VARA/Mercury only).\n");
         fprintf(stderr, " -w retry_wait                Seconds before calling a station again after a failed call or\n");
         fprintf(stderr, "                               finished session (default %d).\n", RETRY_BACKOFF_DEFAULT);
+        fprintf(stderr, " -g                           Guest mode (VARA/Mercury): any station may connect for an echo\n");
+        fprintf(stderr, "                               test or a short message; replies for a guest go in\n");
+        fprintf(stderr, "                               input_spool_directory/<CALLSIGN>/ and are sent when it calls.\n");
         fprintf(stderr, " -a tnc_ip_address            IP address of the TNC,\n");
         fprintf(stderr, " -p tcp_base_port              TCP base port of the TNC. For VARA and ARDOP ports tcp_base_port and tcp_base_port+1 are used,\n");
         fprintf(stderr, " -t timeout                 Time to wait before disconnect when idling.\n");
@@ -235,7 +250,7 @@ int main (int argc, char *argv[])
 
     char *last;
     int opt;
-    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:")) != -1)
+    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:g")) != -1)
     {
         switch (opt)
         {
@@ -255,6 +270,9 @@ int main (int argc, char *argv[])
                 fprintf(stderr, "Invalid -d remote callsign list: %s\n", optarg);
                 exit(EXIT_FAILURE);
             }
+            break;
+        case 'g':
+            connector.guests_enabled = true;
             break;
         case 'w':
             connector.retry_backoff = atoi(optarg);
@@ -431,6 +449,8 @@ connector_start:
         // remote station is known (see vara.c)
         if (!spool_create_peer_dirs(&connector))
             fprintf(stderr, "Warning: some peer spool directories could not be created.\n");
+        if (connector.guests_enabled)
+            fprintf(stderr, "Guest mode on: any station may connect for an echo test or a short message.\n");
     }
     pthread_create(&tid[1], NULL, spool_output_directory_thread, (void *) &connector);
 

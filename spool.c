@@ -541,6 +541,14 @@ int spool_load_peer(rhizo_conn *connector, int peer_idx)
     return count;
 }
 
+/* Guests: load <input_directory>/<CALL>/ (call already validated). */
+int spool_load_call(rhizo_conn *connector, const char *call_sign)
+{
+    char dir[1100];
+    snprintf(dir, sizeof(dir), "%s%s/", connector->input_directory, call_sign);
+    return scan_dir(connector, dir, true);
+}
+
 /* Drop everything not yet handed to the modem and forget the queued paths
  * WITHOUT deleting the files. Caller must make sure the data tx thread is
  * parked (tx_hold && tx_idle). */

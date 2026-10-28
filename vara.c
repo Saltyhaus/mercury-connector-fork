@@ -51,6 +51,7 @@
 #include "spool.h"
 #include "vara.h"
 #include "radio_io.h"
+#include "guest.h"
 
 void *vara_data_worker_thread_tx(void *conn)
 {
@@ -235,6 +236,18 @@ void *vara_data_worker_thread_rx(void *conn)
             continue;
         }
 
+        int kind = connector->session_kind;
+        if (kind == SESSION_REJECTED || (kind == SESSION_GUEST && frame_size > GUEST_MAX_MSG))
+        {
+            fprintf(stderr, kind == SESSION_REJECTED
+                    ? "Data from a station that is neither a peer nor a valid callsign: discarded.\n"
+                    : "Guest message too long (%u bytes, max %d): discarding the rest of this session's data.\n",
+                    frame_size, GUEST_MAX_MSG);
+            while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
+                rx_discard_pending(connector);
+            continue;
+        }
+
         rx_set_safe(connector, &safe, false);   // mid-frame: not idle
 
         uint8_t *frame = (uint8_t *) malloc(frame_size);
@@ -251,6 +264,15 @@ void *vara_data_worker_thread_rx(void *conn)
         {
             fprintf(stderr, "Link lost mid-message: partial message (%u bytes expected) discarded, "
                     "sender will retry.\n", frame_size);
+            free(frame);
+            continue;
+        }
+
+        if (kind == SESSION_GUEST)
+        {
+            // guests: echo pings and short messages, handled here; the
+            // inbox file is written with our header, not theirs
+            guest_handle_frame(connector, frame, frame_size, gen);
             free(frame);
             continue;
         }
@@ -323,6 +345,14 @@ void *vara_control_worker_thread_rx(void *conn)
                     connector->session_ready = false;
                     snprintf(connector->session_peer, sizeof(connector->session_peer), "%s",
                              peer ? peer : "");
+                    guest_session_start(connector);
+                    if (!connector->guests_enabled || find_peer(connector, connector->session_peer) >= 0)
+                        connector->session_kind = SESSION_PEER;
+                    else if (guest_call_valid(connector->session_peer, connector->guest_call,
+                                              sizeof(connector->guest_call)))
+                        connector->session_kind = SESSION_GUEST;
+                    else
+                        connector->session_kind = SESSION_REJECTED;
                     connector->session_active = true;
                     connector->incoming_pending = false;
                     connector->rx_session_gen++;   // frames must start in this session
@@ -377,6 +407,7 @@ void *vara_control_worker_thread_rx(void *conn)
                     }
                     else
                     {
+                        guest_note_modem_line(connector, (const char *) buffer);
                         if (connector->serial_keying == true)
                         {
                             if (!memcmp(buffer, "PTT ON", strlen("PTT ON")))
@@ -467,6 +498,16 @@ void *vara_control_worker_thread_tx(void *conn)
                 int n = spool_load_peer(connector, idx);
                 fprintf(stderr, "Session with %s: %d message(s) queued.\n", connector->peers[idx], n);
             }
+            else if (connector->session_kind == SESSION_GUEST)
+            {
+                int n = spool_load_call(connector, connector->guest_call);
+                fprintf(stderr, "Guest session with %s: %d message(s) queued.\n", connector->guest_call, n);
+            }
+            else if (connector->session_kind == SESSION_REJECTED)
+            {
+                fprintf(stderr, "Session with \"%s\": not a peer and not a valid callsign, nothing will be kept.\n",
+                        connector->session_peer);
+            }
             else
             {
                 fprintf(stderr, "Session with %s (not a configured peer): receive only.\n",
@@ -485,6 +526,13 @@ void *vara_control_worker_thread_tx(void *conn)
                 int n = spool_load_peer(connector, idx);
                 if (n > 0)
                     fprintf(stderr, "Session with %s: %d more message(s) queued.\n", connector->peers[idx], n);
+            }
+            else if (connector->session_kind == SESSION_GUEST)
+            {
+                guest_tick(connector);
+                int n = spool_load_call(connector, connector->guest_call);
+                if (n > 0)
+                    fprintf(stderr, "Guest session with %s: %d more message(s) queued.\n", connector->guest_call, n);
             }
         }
 

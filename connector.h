@@ -114,7 +114,26 @@ typedef struct{
     atomic_bool tx_idle;            // data tx thread is parked in its wait loop
     atomic_uint rx_session_gen;     // bumped on every CONNECTED/DISCONNECTED; a
                                     // received frame must start and end in one
+
+// guest mode (-g, VARA/Mercury only; see guest.c)
+    bool guests_enabled;
+    atomic_int session_kind;        // SESSION_PEER, SESSION_GUEST or SESSION_REJECTED
+    char guest_call[16];            // validated, uppercased callsign of a guest session
+    int guest_msgs;                 // rx thread only
+    int guest_echoes;               // rx thread only
+    pthread_mutex_t echo_mutex;
+    bool echo_pending;
+    unsigned echo_gen;
+    char echo_quote[128];
+    atomic_int snr_x10;             // last "SN" from the modem this session, dB x10
+    atomic_bool snr_valid;
+    atomic_int bps;                 // last "BITRATE" from the modem this session
 } rhizo_conn;
+
+// what kind of station the current session is with
+#define SESSION_PEER 0      // a -d peer (or anyone, without -g: receive only)
+#define SESSION_GUEST 1     // -g: a guest with a valid callsign
+#define SESSION_REJECTED 2  // -g: not a peer and not a usable callsign; nothing kept
 
 #ifdef __cplusplus
 };
