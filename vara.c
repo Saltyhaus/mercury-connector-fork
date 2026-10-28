@@ -46,6 +46,7 @@
 #include <strings.h>
 #include <time.h>
 #include <poll.h>
+#include <unistd.h>
 #include <errno.h>
 
 #include "spool.h"
@@ -133,15 +134,35 @@ static void rx_set_safe(rhizo_conn *connector, bool *safe, bool want)
     }
 }
 
-/* Wait up to RX_POLL_MS and throw away whatever is readable. */
-static void rx_discard_pending(rhizo_conn *connector)
+/* Wait up to RX_POLL_MS and throw away whatever is readable.
+ *
+ * idle: we're between sessions. The modem reports CONNECTED on the control
+ * port and the first data on the data port, and nothing orders the two for
+ * us: the first frame of a new session can be readable here a moment before
+ * the control thread has marked the session up. So before calling bytes
+ * stale, give a just-starting session a short grace period, and leave the
+ * bytes alone if one shows up. */
+#define RX_NEW_SESSION_GRACE_MS 1000
+
+static void rx_discard_pending(rhizo_conn *connector, bool idle)
 {
     uint8_t scratch[1024];
     struct pollfd pfd = { .fd = connector->data_socket, .events = POLLIN };
+    unsigned gen0 = connector->rx_session_gen;
 
     int r = poll(&pfd, 1, RX_POLL_MS);
     if (r <= 0)
         return;
+
+    if (idle)
+    {
+        for (int waited = 0; waited < RX_NEW_SESSION_GRACE_MS; waited += 50)
+        {
+            if (connector->connected || connector->rx_session_gen != gen0)
+                return;                 // a session just started: these bytes are its
+            usleep(50 * 1000);
+        }
+    }
 
     ssize_t len = recv(connector->data_socket, scratch, sizeof(scratch), 0);
     if (len == 0 || (len < 0 && errno != EINTR))
@@ -217,7 +238,7 @@ void *vara_data_worker_thread_rx(void *conn)
 
         if (!connector->connected)
         {
-            rx_discard_pending(connector);
+            rx_discard_pending(connector, true);
             continue;
         }
 
@@ -232,7 +253,7 @@ void *vara_data_worker_thread_rx(void *conn)
             fprintf(stderr, "Corrupt frame header (length %u): discarding the rest of this session's data.\n",
                     frame_size);
             while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
-                rx_discard_pending(connector);
+                rx_discard_pending(connector, false);
             continue;
         }
 
@@ -244,7 +265,7 @@ void *vara_data_worker_thread_rx(void *conn)
                     : "Guest message too long (%u bytes, max %d): discarding the rest of this session's data.\n",
                     frame_size, GUEST_MAX_MSG);
             while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
-                rx_discard_pending(connector);
+                rx_discard_pending(connector, false);
             continue;
         }
 
@@ -256,7 +277,7 @@ void *vara_data_worker_thread_rx(void *conn)
             fprintf(stderr, "Out of memory for a %u byte frame, discarding the rest of this session.\n", frame_size);
             rx_set_safe(connector, &safe, true);
             while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
-                rx_discard_pending(connector);
+                rx_discard_pending(connector, false);
             continue;
         }
 
