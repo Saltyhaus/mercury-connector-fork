@@ -155,6 +155,36 @@ static size_t clean_text(const uint8_t *in, size_t len, char *out, size_t out_si
     return strlen(out);
 }
 
+static void event_line(rhizo_conn *connector, const char *json_fields)
+{
+    if (connector->events_path[0] == 0)
+        return;
+    pthread_mutex_lock(&connector->events_mutex);
+    FILE *f = fopen(connector->events_path, "a");
+    if (f != NULL)
+    {
+        fprintf(f, "{\"t\":%ld,%s}\n", (long) time(NULL), json_fields);
+        fclose(f);
+    }
+    else
+        fprintf(stderr, "Events file %s: %s\n", connector->events_path, strerror(errno));
+    pthread_mutex_unlock(&connector->events_mutex);
+}
+
+void guest_event_link(rhizo_conn *connector, bool up)
+{
+    char fields[96];
+    if (!up)
+        snprintf(fields, sizeof(fields), "\"event\":\"link_down\"");
+    else if (connector->session_kind == SESSION_GUEST)
+        snprintf(fields, sizeof(fields), "\"event\":\"link_up\",\"who\":\"guest\",\"call\":\"%s\"",
+                 connector->guest_call);
+    else
+        snprintf(fields, sizeof(fields), "\"event\":\"link_up\",\"who\":\"%s\"",
+                 connector->session_kind == SESSION_PEER ? "peer" : "unknown");
+    event_line(connector, fields);
+}
+
 static bool store_guest_message(rhizo_conn *connector, const char *body)
 {
     static unsigned long counter = 0;
@@ -188,7 +218,12 @@ static bool store_guest_message(rhizo_conn *connector, const char *body)
     }
     unlink(tmp_path);
     if (ok)
+    {
+        char fields[64];
         fprintf(stderr, "Guest %s: message stored as %s.\n", connector->guest_call, name);
+        snprintf(fields, sizeof(fields), "\"event\":\"message\",\"call\":\"%s\"", connector->guest_call);
+        event_line(connector, fields);
+    }
     return ok;
 }
 
@@ -301,4 +336,20 @@ void guest_tick(rhizo_conn *connector)
     write_buffer(&connector->in_buffer, (uint8_t *) name, sizeof(name) - 1);
     write_buffer(&connector->in_buffer, (uint8_t *) text, len);
     fprintf(stderr, "Guest %s: echo reply queued (SNR %s, %s).\n", connector->guest_call, snr, rate);
+
+    char fields[128], snr_json[16], bps_json[16];
+    if (connector->snr_valid)
+    {
+        int v = connector->snr_x10;
+        snprintf(snr_json, sizeof(snr_json), "%s%d.%d", v < 0 ? "-" : "", abs(v) / 10, abs(v) % 10);
+    }
+    else
+        snprintf(snr_json, sizeof(snr_json), "null");
+    if (connector->bps > 0)
+        snprintf(bps_json, sizeof(bps_json), "%d", (int) connector->bps);
+    else
+        snprintf(bps_json, sizeof(bps_json), "null");
+    snprintf(fields, sizeof(fields), "\"event\":\"echo\",\"call\":\"%s\",\"snr\":%s,\"bps\":%s",
+             connector->guest_call, snr_json, bps_json);
+    event_line(connector, fields);
 }

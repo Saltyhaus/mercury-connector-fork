@@ -149,6 +149,8 @@ bool initialize_connector(rhizo_conn *connector){
     connector->snr_x10 = 0;
     connector->snr_valid = false;
     connector->bps = 0;
+    connector->events_path[0] = 0;
+    pthread_mutex_init(&connector->events_mutex, NULL);
     connector->session_active = false;
     connector->session_ready = false;
     connector->tx_hold = true;
@@ -235,6 +237,7 @@ int main (int argc, char *argv[])
         fprintf(stderr, " -g                           Guest mode (VARA/Mercury): any station may connect for an echo\n");
         fprintf(stderr, "                               test or a short message; replies for a guest go in\n");
         fprintf(stderr, "                               input_spool_directory/<CALLSIGN>/ and are sent when it calls.\n");
+        fprintf(stderr, " -e events_file               Append link/guest events as JSON lines (for a status page).\n");
         fprintf(stderr, " -a tnc_ip_address            IP address of the TNC,\n");
         fprintf(stderr, " -p tcp_base_port              TCP base port of the TNC. For VARA and ARDOP ports tcp_base_port and tcp_base_port+1 are used,\n");
         fprintf(stderr, " -t timeout                 Time to wait before disconnect when idling.\n");
@@ -250,7 +253,7 @@ int main (int argc, char *argv[])
 
     char *last;
     int opt;
-    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:g")) != -1)
+    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:ge:")) != -1)
     {
         switch (opt)
         {
@@ -273,6 +276,9 @@ int main (int argc, char *argv[])
             break;
         case 'g':
             connector.guests_enabled = true;
+            break;
+        case 'e':
+            snprintf(connector.events_path, sizeof(connector.events_path), "%s", optarg);
             break;
         case 'w':
             connector.retry_backoff = atoi(optarg);

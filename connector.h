@@ -128,6 +128,8 @@ typedef struct{
     atomic_int snr_x10;             // last "SN" from the modem this session, dB x10
     atomic_bool snr_valid;
     atomic_int bps;                 // last "BITRATE" from the modem this session
+    char events_path[1024];         // -e: JSON lines of link/guest events ("" = off)
+    pthread_mutex_t events_mutex;
 } rhizo_conn;
 
 // what kind of station the current session is with

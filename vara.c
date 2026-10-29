@@ -374,6 +374,7 @@ void *vara_control_worker_thread_rx(void *conn)
                         connector->session_kind = SESSION_GUEST;
                     else
                         connector->session_kind = SESSION_REJECTED;
+                    guest_event_link(connector, true);
                     connector->session_active = true;
                     connector->incoming_pending = false;
                     connector->rx_session_gen++;   // frames must start in this session
@@ -500,6 +501,7 @@ void *vara_control_worker_thread_tx(void *conn)
 
             fprintf(stderr, "Session with %s ended (%zu unacknowledged message(s) kept for retry).\n",
                     connector->session_peer[0] ? connector->session_peer : "unknown", pending);
+            guest_event_link(connector, false);
 
             connector->session_peer[0] = 0;
             connector->session_ready = false;

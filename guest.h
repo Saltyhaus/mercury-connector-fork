@@ -51,6 +51,15 @@ void guest_tick(rhizo_conn *connector);
 /* Reset per-session guest state (on CONNECTED). */
 void guest_session_start(rhizo_conn *connector);
 
+/* -e events file: one JSON object per line, for a status page.
+ *   {"t":<unix>,"event":"link_up","who":"guest","call":"K1ABC"}
+ *   {"t":<unix>,"event":"link_up","who":"peer"}      (our own stations: no call)
+ *   {"t":<unix>,"event":"link_down"}
+ *   {"t":<unix>,"event":"echo","call":"K1ABC","snr":6.2,"bps":1400}   (snr/bps null if unknown)
+ *   {"t":<unix>,"event":"message","call":"K1ABC"}
+ * Calls written here are always validated guest callsigns. */
+void guest_event_link(rhizo_conn *connector, bool up);
+
 #ifdef __cplusplus
 };
 #endif
