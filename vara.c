@@ -64,6 +64,25 @@ static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Bookkeeping for a session that is over: back off the peer, log, write
  * link_down. Does not touch the transmit ring (the caller, or the next
  * session setup, resets that with tx parked). Call with session_lock held. */
+/* How long to wait before calling a peer again after `failed` unanswered
+ * calls in a row: the normal wait for the first two, then 5 and 15 minutes,
+ * then retry_max -- a station that is switched off isn't called all day. */
+int retry_wait_for(int failed, int base, int max)
+{
+    int wait = base;
+    if (failed >= 7)
+        wait = max;
+    else if (failed >= 5)
+        wait = 900;
+    else if (failed >= 3)
+        wait = 300;
+    if (wait < base)
+        wait = base;
+    if (max > 0 && wait > max)
+        wait = max > base ? max : base;
+    return wait;
+}
+
 static void session_end_bookkeeping(rhizo_conn *connector, const char *how, size_t pending)
 {
     time_t now = time(NULL);
@@ -543,6 +562,11 @@ void *vara_control_worker_thread_rx(void *conn)
                     else
                         connector->session_kind = SESSION_REJECTED;
                     guest_event_link(connector, true);
+                    {   // heard from this peer: back to the normal call rate
+                        int heard = find_peer(connector, connector->session_peer);
+                        if (heard >= 0)
+                            connector->peer_failed_calls[heard] = 0;
+                    }
                     connector->session_active = true;
                     connector->incoming_pending = false;
                     connector->rx_session_gen++;   // frames must start in this session
@@ -754,11 +778,13 @@ void *vara_control_worker_thread_tx(void *conn)
                     fprintf(stderr, "No answer to our call after %d s: aborting it.\n", CONNECT_ATTEMPT_MAX_S);
                     connector->tcp_ret_ok &= tcp_write(connector->control_socket, (uint8_t *) "ABORT\r", 6);
                 }
-                // random extra wait, so two stations that keep calling each
-                // other at the same moment drift apart instead of clashing again
-                int wait = connector->retry_backoff + rand() % (connector->retry_backoff / 4 + 1);
-                fprintf(stderr, "Call to %s failed, retrying in %d s.\n",
-                        connector->peers[connector->attempt_peer], wait);
+                // longer waits for a station that keeps not answering, plus a
+                // random extra so two stations calling each other drift apart
+                int failed = ++connector->peer_failed_calls[connector->attempt_peer];
+                int base = retry_wait_for(failed, connector->retry_backoff, connector->retry_max);
+                int wait = base + rand() % (base / 4 + 1);
+                fprintf(stderr, "Call to %s failed, retrying in %d s (%d unanswered in a row).\n",
+                        connector->peers[connector->attempt_peer], wait, failed);
                 connector->peer_retry_after[connector->attempt_peer] = now + wait;
                 connector->attempt_peer = -1;
                 connector->waiting_for_connection = false;

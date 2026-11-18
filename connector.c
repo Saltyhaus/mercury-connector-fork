@@ -157,7 +157,11 @@ bool initialize_connector(rhizo_conn *connector){
     connector->tx_idle = false;
     connector->rx_session_gen = 0;
     for (int i = 0; i < MAX_PEERS; i++)
+    {
         connector->peer_retry_after[i] = 0;
+        connector->peer_failed_calls[i] = 0;
+    }
+    connector->retry_max = RETRY_MAX_DEFAULT;
     return true;
 }
 
@@ -234,7 +238,11 @@ int main (int argc, char *argv[])
         fprintf(stderr, "                               itself go to the first one (VARA/Mercury only). Optional: without\n");
         fprintf(stderr, "                               it nothing is called and the spool goes to whoever connects.\n");
         fprintf(stderr, " -w retry_wait                Seconds before calling a station again after a failed call or\n");
-        fprintf(stderr, "                               finished session (default %d).\n", RETRY_BACKOFF_DEFAULT);
+        fprintf(stderr, "                               finished session (default %d). A station that keeps not\n", RETRY_BACKOFF_DEFAULT);
+        fprintf(stderr, "                               answering is called less often: 2 tries at that, then 5 min,\n");
+        fprintf(stderr, "                               15 min, then -W (back to normal as soon as it is heard).\n");
+        fprintf(stderr, " -W retry_max                 Longest wait between calls to a station that doesn't answer\n");
+        fprintf(stderr, "                               (default %d s).\n", RETRY_MAX_DEFAULT);
         fprintf(stderr, " -g                           Guest mode (VARA/Mercury): any station may connect for an echo\n");
         fprintf(stderr, "                               test or a short message; replies for a guest go in\n");
         fprintf(stderr, "                               input_spool_directory/<CALLSIGN>/ and are sent when it calls.\n");
@@ -254,7 +262,7 @@ int main (int argc, char *argv[])
 
     char *last;
     int opt;
-    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:ge:")) != -1)
+    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:W:ge:")) != -1)
     {
         switch (opt)
         {
@@ -285,6 +293,11 @@ int main (int argc, char *argv[])
             connector.retry_backoff = atoi(optarg);
             if (connector.retry_backoff < 0)
                 connector.retry_backoff = 0;
+            break;
+        case 'W':
+            connector.retry_max = atoi(optarg);
+            if (connector.retry_max < 0)
+                connector.retry_max = 0;
             break;
         case 't':
             connector.timeout = atoi(optarg);

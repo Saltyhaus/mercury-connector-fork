@@ -52,6 +52,7 @@ extern "C" {
 #define MAX_PEERS 16
 // seconds to wait before calling a peer again after a failed attempt or a finished session
 #define RETRY_BACKOFF_DEFAULT 120
+#define RETRY_MAX_DEFAULT 3600      // a station that never answers is called at most hourly
 // give up on an outbound CONNECT the modem never answered (and ABORT it)
 #ifndef CONNECT_ATTEMPT_MAX_S
 #define CONNECT_ATTEMPT_MAX_S 300
@@ -113,6 +114,8 @@ typedef struct{
     char peers[MAX_PEERS][32];      // from -d CALL1,CALL2,...; peers[0] is the default
     int num_peers;
     time_t peer_retry_after[MAX_PEERS];
+    int peer_failed_calls[MAX_PEERS]; // unanswered calls in a row; reset when the peer is heard
+    int retry_max;                  // -W: longest wait between calls to an unanswering peer
     int next_peer;                  // round-robin start index for outbound calls
     int retry_backoff;              // -w seconds
     int attempt_peer;               // peer index of the outstanding CONNECT, -1 if none

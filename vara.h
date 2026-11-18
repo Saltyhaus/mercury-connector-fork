@@ -51,4 +51,7 @@ bool initialize_modem_vara(rhizo_conn *connector);
 };
 #endif
 
+/* wait before calling a peer again after `failed` unanswered calls in a row */
+int retry_wait_for(int failed, int base, int max);
+
 #endif /* HAVE_VARA__ */
